@@ -1,21 +1,20 @@
 //  ONLY CHANGE VARIABLES HERE!
 // BUILD_AS_ANCHOR nicht auskommentiert -> Anchor, falls auskommentiert dann Tag
-#define BUILD_AS_ANCHOR
+//#define BUILD_AS_ANCHOR
 #define UWB_INDEX "0"
 
 // IMPORTS
-#include <Wire.h>             // Lib fürs Display & Kommunikation
-#include <Adafruit_GFX.h>     // Lib fürs Display
-#include <Adafruit_SSD1306.h> // Lib fürs Display
-#include <Arduino.h>          // Lib für Arduino Grundfunktionen
+#include <Wire.h> // lib for display / communication
+#include <Adafruit_GFX.h> // lib for display
+#include <Adafruit_SSD1306.h> // lib for display
+#include <Arduino.h> // lib for basic arduino
 
 #ifdef BUILD_AS_ANCHOR
 // placeholder
 #else
-#include <WiFi.h>
-#include <WiFiUdp.h>
 #include <MAVLink.h>
 #endif
+
 
 // VARIABLES
 // screen
@@ -23,42 +22,45 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
-#define I2C_SCREEN_SDA 39 // esp32 Pins, die für Display (I2C) Kommunikation benutzt werden
-#define I2C_SCREEN_SCL 38 // esp32 Pins, die für Display (I2C) Kommunikation benutzt werden
+#define I2C_SCREEN_SDA 39 // IO39
+#define I2C_SCREEN_SCL 38 // IO38
 
 // uwb
-#define IO_RXD2 18
-#define IO_TXD2 17
+#define IO_RXD2 18 // IO18
+#define IO_TXD2 17 // IO18
 #define UWB_RESET 16 // IO16
-#define UWB_TAG_COUNT 1
+#define UWB_TAG_COUNT "1"
 #ifdef BUILD_AS_ANCHOR // Wenn oben BUILD_AS_ANCHOR definiert ist
 #define UWB_ROLE "1"   // 1 = Anchor
 #else                  // wenn oben BUILD_AS_ANCHOR auskommentiert ist
 #define UWB_ROLE "0"   // 0 = Tag
+#define IO_FC_RX 1  // Connect Flight Controller TX wire here
+#define IO_FC_TX 2  // Connect Flight Controller RX wire here
+// FC serial object, UART-Port 1
+HardwareSerial SERIAL_FC(1);
 #endif
-#define UWB_TAG_COUNT "1"
 
-// LOG serial
-#define SERIAL_LOG Serial // die normale USB‑Serielle zum PC
+// LOG serial, usb to computer
+#define SERIAL_LOG Serial
 // UWB serial
 #define SERIAL_AT mySerial2
 
-// uwb serial object
-HardwareSerial SERIAL_AT(2); // Dedizierte serielle Verbindung fürs UWB-Modul, welche UART-Port 2 verwendet
+// uwb serial object, UART-Port 2
+HardwareSerial SERIAL_AT(2);
 
 // display object
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); // ein Object namens display wird erzeugt.
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // wifi
-#ifdef BUILD_AS_ANCHOR
+// #ifdef BUILD_AS_ANCHOR
 // placeholder
-#else
-const char *ssid = "DroneTracker_UWB";
-const char *password = "password123";
-WiFiUDP udp;
-const int udpPort = 14550;
-IPAddress broadcastIP(192, 168, 4, 255);
-#endif
+// #else
+// const char *ssid = "DroneTracker_UWB";
+// const char *password = "password123";
+// WiFiUDP udp;
+// const int udpPort = 14550;
+// IPAddress broadcastIP(192, 168, 4, 255);
+// #endif
 
 // loop variables
 String response = "";
@@ -67,22 +69,18 @@ unsigned long lastSendTime = 0;
 const unsigned long sendInterval = 250; // 250 milliseconds = 4 times per second
 // FUNCTIONS
 
-// wifi
-#ifdef BUILD_AS_ANCHOR
-
-#else
+#ifndef BUILD_AS_ANCHOR
 void send_mavlink_heartbeat()
 {
   mavlink_message_t msg;
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
-  // Tell QGC: "I am a Quadrotor, Active and ready"
-  mavlink_msg_heartbeat_pack(1, 1, &msg, MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_GENERIC, MAV_MODE_GUIDED_ARMED, 0, MAV_STATE_ACTIVE);
+  // Tell QGC/FC: "I am a Quadrotor, Active and ready"
+  mavlink_msg_heartbeat_pack(1, 100, &msg, MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_GENERIC, MAV_MODE_GUIDED_ARMED, 0, MAV_STATE_ACTIVE);
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
 
-  udp.beginPacket(broadcastIP, udpPort);
-  udp.write(buf, len);
-  udp.endPacket();
+  // Write directly to the wire!
+  SERIAL_FC.write(buf, len);
 }
 
 void send_mavlink_position(float distance_meters)
@@ -94,18 +92,15 @@ void send_mavlink_position(float distance_meters)
   int32_t base_lat = 474999500;
   int32_t base_lon = 87375650;
 
-  // 1D Hack: We only move along the Longitude (East/West)
-  // 1 meter of distance is roughly 133 units of Longitude at this Latitude
   int32_t current_lat = base_lat;
   int32_t current_lon = base_lon + (distance_meters * 133.0);
   int32_t alt_mm = 0;
 
-  mavlink_msg_global_position_int_pack(1, 1, &msg, millis(), current_lat, current_lon, alt_mm, alt_mm, 0, 0, 0, 0);
+  mavlink_msg_global_position_int_pack(1, 100, &msg, millis(), current_lat, current_lon, alt_mm, alt_mm, 0, 0, 0, 0);
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
 
-  udp.beginPacket(broadcastIP, udpPort);
-  udp.write(buf, len);
-  udp.endPacket();
+  // Write directly to the wire!
+  SERIAL_FC.write(buf, len);
 }
 #endif
 
@@ -114,19 +109,20 @@ void setup()
 {
 
 #ifdef BUILD_AS_ANCHOR
-// placeholder
 #else
-  SERIAL_LOG.print("Creating Wi-Fi Network...");
+  // SERIAL_LOG.print("Creating Wi-Fi Network...");
   // Start the Access Point
-  WiFi.softAP(ssid, password);
-  SERIAL_LOG.println(" Done!");
-  SERIAL_LOG.print("Connect your Mac to Wi-Fi: ");
-  SERIAL_LOG.println(ssid);
-  SERIAL_LOG.print("ESP32 IP Address: ");
-  SERIAL_LOG.println(WiFi.softAPIP());
+  // WiFi.softAP(ssid, password);
+  // SERIAL_LOG.println(" Done!");
+  // SERIAL_LOG.print("Connect your Mac to Wi-Fi: ");
+  // SERIAL_LOG.println(ssid);
+  // SERIAL_LOG.print("ESP32 IP Address: ");
+  // SERIAL_LOG.println(WiFi.softAPIP());
 
   // Start listening/sending on the UDP port
-  udp.begin(udpPort);
+  // udp.begin(udpPort);
+  // Start the hardware connection to the Flight Controller
+  SERIAL_FC.begin(115200, SERIAL_8N1, IO_FC_RX, IO_FC_TX);
 #endif
 
   // uwb setup
@@ -267,15 +263,15 @@ void printDisplay()
   display.setCursor(0, 40);
 
 #ifdef BUILD_AS_ANCHOR
-  display.println("A" UWB_INDEX); // Wenn Anchor -> sieht man "A" auf dem Display
+  display.println("A" UWB_INDEX); // anchor -> "A" on tag
 #else
-  display.println("T" UWB_INDEX); // Wenn Tag -> sieht man "T" auf dem Display
+  display.println("T" UWB_INDEX); // tag -> "T" on tag
 #endif
 
   display.display();
 }
 
-// Funktion: Sendet einen AT-Befehl ans UWB-Modul & wartet eine definierte Zeit auf die Antwort.
+// helper function for sending AT-Commands from the esp32 to the UWB module
 String sendData(String command, const int timeout, boolean debug)
 {
   String response = "";
@@ -305,13 +301,13 @@ String sendData(String command, const int timeout, boolean debug)
   return response;
 }
 
-// Liefert einen zusammengesetzten String zurück
+// config command for uwb
 String config_cmd()
 {
   return "AT+SETCFG=" UWB_INDEX "," UWB_ROLE ",1,1";
 }
 
-// wie config_cmd, baut einen AT-String zusammen
+// cap command for uwb
 String cap_cmd()
 {
   return "AT+SETCAP=" UWB_TAG_COUNT ",10,1";
