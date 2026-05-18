@@ -4,6 +4,22 @@
 // UWB_INDEX: 0..3 für Anchors, beliebige Zahl für Tag
 #define UWB_INDEX 0
 
+// ENABLE_WIFI_DEBUG: 1 = WiFi SoftAP + UDP debug stream to laptop plotter,
+//                    0 = no WiFi at all (radio fully off).
+// Disable when chasing power / brownout issues -- WiFi TX bursts pull
+// 350-500 mA peaks that sag the ESP's supply rail and cause MAVLink
+// heartbeats to drop on the FC side. MAVLink to the FC is unaffected
+// either way; only the laptop-side debug data goes away.
+#define ENABLE_WIFI_DEBUG 0
+
+// VERBOSE_UWB_LOG: 1 = echo every UWB line and per-VPE-send debug to USB
+//                  Serial. HEAVY -- ~10 KB/s of USB writes at fps=66.
+//                  0 = quiet (default).
+// With no USB host attached during flight, blocking writes can stall the
+// loop, drop UART bytes from the UWB module, and starve MAVLink
+// heartbeats / VPE. Only enable when actively debugging on USB.
+#define VERBOSE_UWB_LOG 0
+
 // Stringify-Helper: macht aus der Zahl UWB_INDEX einen String fürs AT-Command
 #define _STR(x) #x
 #define STR(x) _STR(x)
@@ -30,6 +46,10 @@
 #endif
 #else
 #include <MAVLink.h>
+#if ENABLE_WIFI_DEBUG
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#endif
 #endif
 
 
@@ -72,24 +92,42 @@ HardwareSerial SERIAL_AT(2);
 // display object
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// wifi
-// #ifdef BUILD_AS_ANCHOR
-// placeholder
-// #else
-// const char *ssid = "DroneTracker_UWB";
-// const char *password = "password123";
-// WiFiUDP udp;
-// const int udpPort = 14550;
-// IPAddress broadcastIP(192, 168, 4, 255);
-// #endif
+// wifi (tag only) -- SoftAP so the laptop joins this ESP32 and listens on UDP
+#if !defined(BUILD_AS_ANCHOR) && ENABLE_WIFI_DEBUG
+const char *ssid = "DroneTracker_UWB";
+const char *password = "drone1234";
+WiFiUDP udp;
+const int udpPort = 14550;
+IPAddress broadcastIP(192, 168, 4, 255);
+#endif
 
 // --- Filtering (tag only) ---
-// Median-of-N on each anchor's distance, run at UWB frame rate. Rejects
-// outlier spikes from multipath. Larger N = more rejection but more latency.
+// EKF3 on the FC does the position smoothing (it has the IMU). On the tag we
+// only do two things: kill range-level multipath spikes, and kill (x, y)
+// fixes that imply impossible jumps. No EMA -- pre-smoothing here would
+// just lag the data the EKF expects to be observation-time-accurate.
+//
+// Median-of-N on each anchor's distance. Rejects single-frame range outliers.
+// Larger N = more rejection, more latency. 5 @ 10 Hz UWB = 500 ms window.
 #define DIST_FILT_N 5
-// EMA on the trilaterated XY position. Lower alpha = smoother but laggier.
-// alpha = 1.0 means no smoothing (raw output). 0.3 is a reasonable default.
-#define POS_EMA_ALPHA 0.3f
+// Velocity gate on the trilaterated (x, y). Reject any fix whose jump from
+// the last accepted fix exceeds this. At slow indoor flight (~0.5 m/s) and
+// 10 Hz updates, real motion is ~0.05 m per frame -- 0.5 m is 10x that, so
+// this only triggers on gross multipath / NLOS spikes, never real motion.
+#define POS_GATE_M 0.5f
+// If the gate rejects this many fixes in a row, accept the next one anyway.
+// Recovery path for: drone picked up and moved, EKF reset, long NLOS stretch.
+#define POS_GATE_MAX_REJECT 10
+
+// --- Per-anchor diagnostics window for the UDP debug stream ---
+// Rolling window used for computing std-dev of each anchor's raw range. 20
+// samples @ 10 Hz = 2 s window -- short enough to react to a degrading anchor,
+// long enough that single spikes don't dominate the metric.
+#define STATS_WIN_N 20
+// Per-frame spike threshold: a frame is flagged for anchor i if
+// |d_raw[i] - median5(buffer[i])| > SPIKE_THRESH_M. 10 cm is well above the
+// ~2-3 cm UWB noise floor but below typical multipath spikes.
+#define SPIKE_THRESH_M 0.10f
 
 // loop variables
 String response = "";
@@ -107,9 +145,31 @@ uint8_t originSendCount = 0;
 float dist_buf[4][DIST_FILT_N] = {{0}};
 uint8_t dist_buf_idx = 0;
 uint8_t dist_buf_count = 0;
-// EMA-smoothed position state.
-float xy_smooth[2] = {0.0f, 0.0f};
-bool xy_smooth_init = false;
+// Per-anchor stats ring (raw distances over a longer window) for std-dev.
+// Zeros mean "anchor not heard on that frame" -- the std calc skips them.
+float stats_buf[4][STATS_WIN_N] = {{0}};
+uint8_t stats_idx = 0;
+uint8_t stats_count = 0;
+// UWB frame rate (Hz), recomputed roughly once per second.
+unsigned long fps_window_start = 0;
+uint16_t fps_counter = 0;
+float current_fps = 0.0f;
+
+// Cached responses to the AT+GET queries run once at boot. Rebroadcast over
+// UDP every modinfoInterval so a laptop that joined the SoftAP late still
+// receives the module's state.
+String modinfo_ver = "";
+String modinfo_cfg = "";
+String modinfo_ant = "";
+String modinfo_cap = "";
+String modinfo_pow = "";
+String modinfo_rpt = "";
+unsigned long lastModinfo = 0;
+const unsigned long modinfoInterval = 5000; // 5 s
+// Velocity-gate state: last accepted (x, y) and consecutive-reject counter.
+float xy_last[2] = {0.0f, 0.0f};
+bool xy_last_init = false;
+uint8_t pos_gate_rejects = 0;
 #endif
 // FUNCTIONS
 
@@ -196,12 +256,142 @@ void send_set_gps_global_origin()
 }
 
 // -----------------------------------------------------------------
+// UDP debug stream to the laptop plotter (uwb_plot.py).
+// Emitted on every UWB frame.
+//
+// CSV line format (21 values after the "UWB" tag, 22 fields total):
+//   UWB,t_ms,mask,fps,
+//       d0,d1,d2,d3,
+//       d0f,d1f,d2f,d3f,
+//       xr,yr,xs,ys,sent,
+//       std0,std1,std2,std3,spk
+//
+//   mask     = 4-bit anchor-heard bitmask from this AT+RANGE frame (0..0x0F)
+//   fps      = UWB frame rate over the last ~1 s
+//   d0..d3   = raw per-anchor distances (m), 0 if anchor not heard
+//   d0f..d3f = median-filtered distances (m), NaN if filter not warm or
+//              not computed this frame (rate-limited to 10 Hz)
+//   xr, yr   = trilateration of raw d's (m), NaN if not all 4 heard
+//   xs, ys   = position actually sent to FC (m), NaN if gate rejected
+//   sent     = 1 if MAVLink VPE emitted this frame, else 0
+//   std0..3  = rolling std-dev of raw distance per anchor (m), NaN until
+//              window warm; zeros excluded so partial NLOS doesn't inflate it
+//   spk      = 4-bit bitmask of anchors flagged as a spike this frame
+//              (|d_raw[i] - running median| > SPIKE_THRESH_M)
+// -----------------------------------------------------------------
+void send_debug_udp(unsigned long t_ms, uint8_t mask, float fps,
+                    const float d_raw[4], const float d_filt[4],
+                    const float stds[4], uint8_t spike_mask,
+                    float xr, float yr, float xs, float ys, bool sent)
+{
+#if ENABLE_WIFI_DEBUG
+  char buf[384];
+  int n = snprintf(buf, sizeof(buf),
+                   "UWB,%lu,%u,%.1f,"
+                   "%.3f,%.3f,%.3f,%.3f,"
+                   "%.3f,%.3f,%.3f,%.3f,"
+                   "%.3f,%.3f,%.3f,%.3f,%d,"
+                   "%.4f,%.4f,%.4f,%.4f,%u\n",
+                   t_ms, (unsigned)mask, fps,
+                   d_raw[0], d_raw[1], d_raw[2], d_raw[3],
+                   d_filt[0], d_filt[1], d_filt[2], d_filt[3],
+                   xr, yr, xs, ys, sent ? 1 : 0,
+                   stds[0], stds[1], stds[2], stds[3], (unsigned)spike_mask);
+  if (n <= 0) return;
+  udp.beginPacket(broadcastIP, udpPort);
+  udp.write((const uint8_t *)buf, (size_t)n);
+  udp.endPacket();
+#else
+  (void)t_ms; (void)mask; (void)fps;
+  (void)d_raw; (void)d_filt; (void)stds; (void)spike_mask;
+  (void)xr; (void)yr; (void)xs; (void)ys; (void)sent;
+#endif
+}
+
+// -----------------------------------------------------------------
+// Broadcasts one cached AT+GET response over UDP so the laptop plotter
+// can show it without a USB connection.
+//
+// Wire format: a single line per key
+//   MODINFO,<key>,<value>
+//
+// The value is the raw module response with CR/LF collapsed to " | "
+// so it stays on one CSV line. The plotter splits on the first two
+// commas only -- any commas inside <value> are kept verbatim.
+// -----------------------------------------------------------------
+void broadcast_modinfo_line(const char *key, const String &value)
+{
+#if ENABLE_WIFI_DEBUG
+  String v = value;
+  v.replace("\r", "");
+  v.replace("\n", " | ");
+  v.trim();
+  char buf[400];
+  int n = snprintf(buf, sizeof(buf), "MODINFO,%s,%s\n", key, v.c_str());
+  if (n <= 0) return;
+  udp.beginPacket(broadcastIP, udpPort);
+  udp.write((const uint8_t *)buf, (size_t)n);
+  udp.endPacket();
+#else
+  (void)key; (void)value;
+#endif
+}
+
+void broadcast_modinfo_all()
+{
+  broadcast_modinfo_line("ver", modinfo_ver);
+  broadcast_modinfo_line("cfg", modinfo_cfg);
+  broadcast_modinfo_line("ant", modinfo_ant);
+  broadcast_modinfo_line("cap", modinfo_cap);
+  broadcast_modinfo_line("pow", modinfo_pow);
+  broadcast_modinfo_line("rpt", modinfo_rpt);
+}
+
+// -----------------------------------------------------------------
+// Filter the noisy response from an AT+GET* query.
+//
+// Auto-reporting (AT+RANGE) is running at the module's frame rate, so
+// during the 1 s capture window the response string is mostly range-
+// data noise with the real GET answer buried inside. Strip every line
+// that looks like a range frame and keep the rest.
+// -----------------------------------------------------------------
+String filter_get_response(const String &raw)
+{
+  String result = "";
+  int from = 0;
+  int len = (int)raw.length();
+  while (from < len)
+  {
+    int newline = raw.indexOf('\n', from);
+    String line = (newline < 0) ? raw.substring(from) : raw.substring(from, newline);
+    line.replace("\r", "");
+    line.trim();
+    if (line.length() > 0 &&
+        line.indexOf("AT+RANGE") < 0 &&
+        line.indexOf("range:(") < 0 &&
+        line.indexOf("mask:") < 0)
+    {
+      if (result.length() > 0) result += " | ";
+      result += line;
+    }
+    if (newline < 0) break;
+    from = newline + 1;
+  }
+  if (result.length() == 0) result = "(no response)";
+  return result;
+}
+
+// -----------------------------------------------------------------
 // Range parser: extracts the 4 anchor distances from a LinkTrack
 // "AT+RANGE,...,range:(d0,d1,d2,d3,...),..." frame. Distances in cm.
-// Writes meters into out[4]. Returns true if all 4 are valid (>0).
+// Writes meters into out[4], with 0.0 for any anchor not heard. Returns
+// true if a "range:(...)" block was found and parsed. The caller decides
+// whether the frame is usable (e.g. by checking the mask).
 // -----------------------------------------------------------------
 bool parse_ranges(const String &line, float out[4])
 {
+  for (int i = 0; i < 4; i++) out[i] = 0.0f;
+
   int rangeIndex = line.indexOf("range:(");
   if (rangeIndex < 0)
     return false;
@@ -218,14 +408,29 @@ bool parse_ranges(const String &line, float out[4])
     String tok = (comma < 0) ? inside.substring(from) : inside.substring(from, comma);
     tok.trim();
     long cm = tok.toInt();
-    if (cm <= 0)
-      return false; // 0 or negative => anchor out of range / not heard
-    out[i] = (float)cm / 100.0f;
+    out[i] = (cm > 0) ? (float)cm / 100.0f : 0.0f;
     if (comma < 0)
-      return (i == 3);
+      break;
     from = comma + 1;
   }
   return true;
+}
+
+// -----------------------------------------------------------------
+// Mask parser: extracts the "mask:XX" hex bitfield from an AT+RANGE
+// frame -- bit i is set if anchor i was heard this frame. Returns 0
+// if no mask was found (treat as "nothing heard").
+// -----------------------------------------------------------------
+uint8_t parse_mask(const String &line)
+{
+  int maskIndex = line.indexOf("mask:");
+  if (maskIndex < 0) return 0;
+  int start = maskIndex + 5;
+  int end = line.indexOf(',', start);
+  if (end < 0) end = line.length();
+  String tok = line.substring(start, end);
+  tok.trim();
+  return (uint8_t)strtol(tok.c_str(), nullptr, 16);
 }
 
 // -----------------------------------------------------------------
@@ -313,18 +518,20 @@ void setup()
 
 #ifdef BUILD_AS_ANCHOR
 #else
-  // SERIAL_LOG.print("Creating Wi-Fi Network...");
-  // Start the Access Point
-  // WiFi.softAP(ssid, password);
-  // SERIAL_LOG.println(" Done!");
-  // SERIAL_LOG.print("Connect your Mac to Wi-Fi: ");
-  // SERIAL_LOG.println(ssid);
-  // SERIAL_LOG.print("ESP32 IP Address: ");
-  // SERIAL_LOG.println(WiFi.softAPIP());
+#if ENABLE_WIFI_DEBUG
+  // SoftAP for the laptop debug stream. The laptop joins "DroneTracker_UWB"
+  // and runs uwb_plot.py to listen on UDP 14550.
+  WiFi.softAP(ssid, password);
+  udp.begin(udpPort);
+  SERIAL_LOG.print("WiFi AP: ");
+  SERIAL_LOG.print(ssid);
+  SERIAL_LOG.print("   IP: ");
+  SERIAL_LOG.println(WiFi.softAPIP());
+#else
+  SERIAL_LOG.println("WiFi debug DISABLED (ENABLE_WIFI_DEBUG=0). Radio off.");
+#endif
 
-  // Start listening/sending on the UDP port
-  // udp.begin(udpPort);
-  // Start the hardware connection to the Flight Controller
+  // Hardware connection to the Flight Controller
   SERIAL_FC.begin(115200, SERIAL_8N1, IO_FC_RX, IO_FC_TX);
 #endif
 
@@ -333,9 +540,16 @@ void setup()
   digitalWrite(UWB_RESET, HIGH);
 
   SERIAL_LOG.begin(115200); // startet die USBSerielle zum PC mit Baud 115200
+  // Non-blocking Serial writes: if no USB host is attached (e.g. during
+  // flight), Serial.print() would otherwise stall up to tens of ms per
+  // call and choke the main loop -- starving MAVLink to the FC and
+  // corrupting UWB UART reads. Timeout 0 -> silently discard when no host.
+  SERIAL_LOG.setTxTimeoutMs(0);
 
-  // Warten bis die Serielle Schnittstelle bereit ist
-  while (!SERIAL_LOG)
+  // Brief wait for the USB host to enumerate (if one is attached). Bounded
+  // so we don't hang forever when running headless.
+  unsigned long log_wait_t0 = millis();
+  while (!SERIAL_LOG && (millis() - log_wait_t0 < 2000))
   {
     delay(10);
   }
@@ -367,8 +581,47 @@ void setup()
   // Antennen-Delay aus Kalibrierung setzen (Wert pro Anchor oben definiert)
   sendData("AT+SETANT=" UWB_ANT_CALIB, 2000, 1);
 #endif
+
+  // --- Optional: boost TX power to fight CF-chassis attenuation. ----
+  // Valid range + units depend on the LinkTrack variant -- check the
+  // AT+SETPOW section of your AT-command manual before enabling. Then
+  // verify with AT+GETPOW? in the diagnostic dump below.
+  // sendData("AT+SETPOW=<value>", 2000, 1);
+  // ------------------------------------------------------------------
+
   sendData("AT+SAVE", 2000, 1);    // Speichert die Konfig im Modul
   sendData("AT+RESTART", 2000, 1); // Startet das Modul mit der neuen Konfig neu
+
+  // --- Diagnostic dump: log module state after the restart so it shows
+  //     what was actually applied (not what we asked for). Visible on
+  //     the USB console at boot. Useful for ----------------------------
+  //       * confirming firmware version when filing a support ticket
+  //       * verifying antenna-delay calibration ended up in the module
+  //       * checking current TX power
+  //       * confirming SETRPT and SETCFG took effect
+  // ----------------------------------------------------------------------
+  delay(1500); // give the module time to come back from AT+RESTART
+  SERIAL_LOG.println(F("--- UWB module state ---"));
+#ifdef BUILD_AS_ANCHOR
+  sendData("AT+GETVER?", 1000, 1);
+  sendData("AT+GETCFG?", 1000, 1);
+  sendData("AT+GETANT?", 1000, 1);
+  sendData("AT+GETCAP?", 1000, 1);
+  sendData("AT+GETPOW?", 1000, 1);
+  sendData("AT+GETRPT?", 1000, 1);
+#else
+  // Capture the responses (filtered to drop the interleaved AT+RANGE
+  // auto-report frames) so we can also broadcast them over UDP.
+  modinfo_ver = filter_get_response(sendData("AT+GETVER?", 1000, 1));
+  modinfo_cfg = filter_get_response(sendData("AT+GETCFG?", 1000, 1));
+  modinfo_ant = filter_get_response(sendData("AT+GETANT?", 1000, 1));
+  modinfo_cap = filter_get_response(sendData("AT+GETCAP?", 1000, 1));
+  modinfo_pow = filter_get_response(sendData("AT+GETPOW?", 1000, 1));
+  modinfo_rpt = filter_get_response(sendData("AT+GETRPT?", 1000, 1));
+  broadcast_modinfo_all();
+  lastModinfo = millis();
+#endif
+  SERIAL_LOG.println(F("------------------------"));
 }
 
 // Läuft unendlich oft hintereinander ab, bis der Strom aus ist.
@@ -409,6 +662,14 @@ void loop()
     SERIAL_LOG.println("[mavlink] heartbeat sent");
   }
 
+  // Rebroadcast the cached AT+GET module info every modinfoInterval so a
+  // laptop that joins the SoftAP mid-flight still receives it.
+  if (millis() - lastModinfo >= modinfoInterval)
+  {
+    lastModinfo = millis();
+    broadcast_modinfo_all();
+  }
+
   // Send SET_GPS_GLOBAL_ORIGIN a few times at startup so the FC will accept
   // vision updates. Skip this if you're setting the origin from the GCS instead.
   if (originSendCount < 5 && (millis() - lastOriginTime > 2000))
@@ -430,65 +691,189 @@ void loop()
     {
       if (response.length() > 0)
       {
-        // DEBUG: dump every line we get from the UWB module so we can see what
-        // it actually says. Comment this out once ranging works to reduce noise.
+        // DEBUG: dump every line we get from the UWB module. Gated by
+        // VERBOSE_UWB_LOG -- heavy I/O (10 KB/s) that blocks the loop
+        // when no USB host is reading.
+#if VERBOSE_UWB_LOG
         SERIAL_LOG.print("[uwb] ");
         SERIAL_LOG.println(response);
+#endif
 
         // Try to parse a range frame. Not every line is one.
         float dist_m[4];
         if (parse_ranges(response, dist_m))
         {
-          // Push every frame into the median ring buffer (don't rate-limit
-          // this -- more samples = better outlier rejection).
-          for (int i = 0; i < 4; i++)
-            dist_buf[i][dist_buf_idx] = dist_m[i];
-          dist_buf_idx = (dist_buf_idx + 1) % DIST_FILT_N;
-          if (dist_buf_count < DIST_FILT_N)
-            dist_buf_count++;
+          uint8_t mask = parse_mask(response);
 
-          // Rate-limit the trilateration + send to 10 Hz, and wait until the
-          // median window is full so the first few frames don't leak through.
-          if (dist_buf_count >= DIST_FILT_N &&
+          // "Heard" means the mask bit is set AND the parsed distance is
+          // positive (occasionally a frame reports a zero distance for a
+          // bit that's nominally set).
+          bool heard[4];
+          bool all_heard = true;
+          for (int i = 0; i < 4; i++)
+          {
+            heard[i] = ((mask >> i) & 0x01) && (dist_m[i] > 0.0f);
+            if (!heard[i]) all_heard = false;
+          }
+
+          // --- FPS over a ~1 s sliding window. ---
+          fps_counter++;
+          unsigned long now_ms = millis();
+          if (now_ms - fps_window_start >= 1000)
+          {
+            unsigned long dt = now_ms - fps_window_start;
+            current_fps = (dt > 0) ? ((float)fps_counter * 1000.0f / (float)dt) : 0.0f;
+            fps_counter = 0;
+            fps_window_start = now_ms;
+          }
+
+          // --- Stats ring: store this frame's raw value per anchor (0 if not
+          //     heard). Std-dev below excludes zeros. ---
+          for (int i = 0; i < 4; i++)
+            stats_buf[i][stats_idx] = heard[i] ? dist_m[i] : 0.0f;
+          stats_idx = (stats_idx + 1) % STATS_WIN_N;
+          if (stats_count < STATS_WIN_N) stats_count++;
+
+          float stds[4] = {NAN, NAN, NAN, NAN};
+          if (stats_count >= STATS_WIN_N)
+          {
+            for (int i = 0; i < 4; i++)
+            {
+              float sum = 0.0f;
+              int n_valid = 0;
+              for (int j = 0; j < STATS_WIN_N; j++)
+              {
+                if (stats_buf[i][j] > 0.0f)
+                {
+                  sum += stats_buf[i][j];
+                  n_valid++;
+                }
+              }
+              if (n_valid < 5) continue; // not enough valid samples
+              float mean = sum / (float)n_valid;
+              float var = 0.0f;
+              for (int j = 0; j < STATS_WIN_N; j++)
+              {
+                if (stats_buf[i][j] > 0.0f)
+                {
+                  float d = stats_buf[i][j] - mean;
+                  var += d * d;
+                }
+              }
+              stds[i] = sqrtf(var / (float)n_valid);
+            }
+          }
+
+          // --- Raw single-frame trilateration (unfiltered) for the debug
+          //     plot's noise-floor visualisation. Needs all 4 anchors. ---
+          float xy_raw_sf[2] = {0.0f, 0.0f};
+          bool raw_ok = false;
+          if (all_heard) raw_ok = trilaterate_2d(dist_m, xy_raw_sf);
+          float xr = raw_ok ? xy_raw_sf[0] : NAN;
+          float yr = raw_ok ? xy_raw_sf[1] : NAN;
+
+          // --- Push to the median ring buffer (only when complete). ---
+          if (all_heard)
+          {
+            for (int i = 0; i < 4; i++)
+              dist_buf[i][dist_buf_idx] = dist_m[i];
+            dist_buf_idx = (dist_buf_idx + 1) % DIST_FILT_N;
+            if (dist_buf_count < DIST_FILT_N) dist_buf_count++;
+          }
+
+          // --- Per-anchor spike detection: compare current raw to the
+          //     running median over the median buffer. Skipped for anchors
+          //     not heard this frame. ---
+          uint8_t spike_mask = 0;
+          if (dist_buf_count >= DIST_FILT_N)
+          {
+            for (int i = 0; i < 4; i++)
+            {
+              if (!heard[i]) continue;
+              float med = median5(dist_buf[i][0], dist_buf[i][1],
+                                  dist_buf[i][2], dist_buf[i][3],
+                                  dist_buf[i][4]);
+              if (fabsf(dist_m[i] - med) > SPIKE_THRESH_M)
+                spike_mask |= (uint8_t)(1 << i);
+            }
+          }
+
+          // --- Filtered path: rate-limited to 10 Hz, only after buffer warm,
+          //     and only on all-heard frames (preserves the original "no VPE
+          //     during NLOS bursts" behaviour -- FC's EKF handles the gap). ---
+          float dist_filt[4] = {NAN, NAN, NAN, NAN};
+          float xs = NAN, ys = NAN;
+          bool sent_this_frame = false;
+
+          if (all_heard && dist_buf_count >= DIST_FILT_N &&
               millis() - lastVisionSend >= visionInterval)
           {
             lastVisionSend = millis();
 
             // Median-filter each anchor's distance.
-            float dist_filt[4];
             for (int i = 0; i < 4; i++)
               dist_filt[i] = median5(dist_buf[i][0], dist_buf[i][1],
                                      dist_buf[i][2], dist_buf[i][3],
                                      dist_buf[i][4]);
 
-            float xy_raw[2];
-            if (trilaterate_2d(dist_filt, xy_raw))
+            float xy_filt[2];
+            if (trilaterate_2d(dist_filt, xy_filt))
             {
-              // EMA smoothing: seed on first valid fix, then blend.
-              if (!xy_smooth_init)
+              // Velocity gate: reject fixes that imply impossible jumps from
+              // the last accepted fix. EKF3 handles smoothing on the FC; we
+              // only need to keep gross multipath spikes out of its input.
+              bool accept = true;
+              float jump = 0.0f;
+              if (xy_last_init)
               {
-                xy_smooth[0] = xy_raw[0];
-                xy_smooth[1] = xy_raw[1];
-                xy_smooth_init = true;
+                float dx = xy_filt[0] - xy_last[0];
+                float dy = xy_filt[1] - xy_last[1];
+                jump = sqrtf(dx * dx + dy * dy);
+                if (jump > POS_GATE_M)
+                {
+                  pos_gate_rejects++;
+                  if (pos_gate_rejects < POS_GATE_MAX_REJECT)
+                  {
+                    accept = false;
+                    SERIAL_LOG.printf("[gate] reject jump=%.2f m (rej=%u/%u)\n",
+                                      jump, pos_gate_rejects, POS_GATE_MAX_REJECT);
+                  }
+                  else
+                  {
+                    SERIAL_LOG.printf("[gate] %u rejects, force-resync to (%.2f, %.2f)\n",
+                                      pos_gate_rejects, xy_filt[0], xy_filt[1]);
+                  }
+                }
               }
-              else
+              if (accept)
               {
-                xy_smooth[0] = POS_EMA_ALPHA * xy_raw[0] +
-                               (1.0f - POS_EMA_ALPHA) * xy_smooth[0];
-                xy_smooth[1] = POS_EMA_ALPHA * xy_raw[1] +
-                               (1.0f - POS_EMA_ALPHA) * xy_smooth[1];
+                xy_last[0] = xy_filt[0];
+                xy_last[1] = xy_filt[1];
+                xy_last_init = true;
+                pos_gate_rejects = 0;
+                xs = xy_filt[0];
+                ys = xy_filt[1];
+                sent_this_frame = true;
+#if VERBOSE_UWB_LOG
+                SERIAL_LOG.printf("d=[%.2f %.2f %.2f %.2f] m  xy=(%.2f, %.2f)\n",
+                                  dist_filt[0], dist_filt[1], dist_filt[2], dist_filt[3],
+                                  xy_filt[0], xy_filt[1]);
+#endif
+                send_mavlink_vision_position(xy_filt[0], xy_filt[1]);
               }
-
-              SERIAL_LOG.printf("d=[%.2f %.2f %.2f %.2f] m  raw=(%.2f, %.2f)  smooth=(%.2f, %.2f)\n",
-                                dist_filt[0], dist_filt[1], dist_filt[2], dist_filt[3],
-                                xy_raw[0], xy_raw[1], xy_smooth[0], xy_smooth[1]);
-              send_mavlink_vision_position(xy_smooth[0], xy_smooth[1]);
             }
             else
             {
               SERIAL_LOG.println("Trilateration failed: anchor geometry singular.");
             }
           }
+
+          // --- Always emit the UDP debug packet, even if the filter wasn't
+          //     warm or the gate rejected the frame. The plotter wants to
+          //     see all of these states. ---
+          send_debug_udp(millis(), mask, current_fps,
+                         dist_m, dist_filt, stds, spike_mask,
+                         xr, yr, xs, ys, sent_this_frame);
         }
         response = "";
       }
@@ -512,8 +897,27 @@ void loop()
 //   EK3_SRC1_VELZ    = 0
 //   EK3_SRC1_YAW     = 1      // Compass for yaw
 //   VISO_TYPE        = 1      // Enable visual odometry input
+//   VISO_DELAY_MS    = 30     // Processing latency UWB sample -> MAVLink, ms.
+//                                Tells the EKF when the measurement actually
+//                                applies (improves fusion timing). 30 ms is
+//                                a safe starting estimate for our pipeline.
+//   EK3_VIS_POS_M_NSE = 0.10  // Vision pos measurement noise, m. Start at
+//                                your real UWB sigma (~0.05-0.15 m). Higher
+//                                = EKF trusts UWB less; lower = trusts more.
+//                                This is the main "smoothing" knob now.
+//   EK3_POS_I_GATE   = 500    // Position innovation gate, 100*sigma units.
+//                                500 = 5 sigma. Tighten to 300 if multipath
+//                                spikes still leak through the on-tag gate.
 //   GPS_TYPE         = 0      // No GPS indoors
 //   ARMING_CHECK     = ...    // May need to disable GPS arming check for indoor
+//
+// Filtering split:
+//   On the tag (this file) we ONLY do (a) median-of-5 on each anchor's range
+//   and (b) a 0.5 m velocity gate on the (x, y) fix. Both are outlier rejects,
+//   not smoothers. All position smoothing is done by EKF3 on the FC, which
+//   has the IMU and produces a much better estimate than anything we could
+//   here. If the EKF estimate looks too jumpy, tune EK3_VIS_POS_M_NSE /
+//   EK3_POS_I_GATE on the FC -- do NOT add an EMA back into this file.
 //
 // LiDAR rangefinder must be configured separately:
 //   RNGFND1_TYPE     = ...    // Match your sensor (e.g. 8 = LightWare I2C, etc.)
