@@ -186,9 +186,9 @@ uint8_t pos_gate_rejects = 0;
 const float ANCHOR_XY[4][2] = {
     // {  X (N) ,  Y (E)  }
     {0.00f, 0.00f}, // Anchor 0
-    {2.90f, 0.00f}, // Anchor 1   (2.9 m North of A0)
-    {2.90f, 3.00f}, // Anchor 2   (3.0 m East of A1)
-    {0.00f, 3.00f}, // Anchor 3   (3.0 m East of A0)
+    {20.00f, 0.00f}, // Anchor 1   (2.9 m North of A0)
+    {20.00f, 20.00f}, // Anchor 2   (3.0 m East of A1)
+    {0.00f, 20.00f}, // Anchor 3   (3.0 m East of A0)
 };
 
 // Approximate vertical separation between the tag (on the drone) and the
@@ -540,14 +540,10 @@ void setup()
   digitalWrite(UWB_RESET, HIGH);
 
   SERIAL_LOG.begin(115200); // startet die USBSerielle zum PC mit Baud 115200
-  // Non-blocking Serial writes: if no USB host is attached (e.g. during
-  // flight), Serial.print() would otherwise stall up to tens of ms per
-  // call and choke the main loop -- starving MAVLink to the FC and
-  // corrupting UWB UART reads. Timeout 0 -> silently discard when no host.
-  SERIAL_LOG.setTxTimeoutMs(0);
 
-  // Brief wait for the USB host to enumerate (if one is attached). Bounded
-  // so we don't hang forever when running headless.
+  // Brief wait for Serial to come up. HardwareSerial is ready immediately
+  // after begin(); this is just defensive in case the board's Serial gets
+  // remapped to USB CDC in a future build.
   unsigned long log_wait_t0 = millis();
   while (!SERIAL_LOG && (millis() - log_wait_t0 < 2000))
   {
